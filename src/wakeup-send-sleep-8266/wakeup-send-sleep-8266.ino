@@ -4,6 +4,8 @@
 
 extern "C" {
 #include <espnow.h>
+
+#include "user_interface.h"
 }
 
 #include <DallasTemperature.h>
@@ -33,12 +35,15 @@ uint8_t macAddr[] = {0x24, 0x6F, 0x28, 0xD1, 0x23, 0x40};
 // uint8_t macAddr[] = {0x80, 0x7D, 0x3A, 0xD5, 0x42, 0x98};
 
 #define WIFI_CHANNEL 4
-#define LONG_SLEEP 3600   // 60 minutes
-#define SHORT_SLEEP 60    // 1 minutes
+#define RTCMEMORYSTART 70
+#define LONG_SLEEP 3600  // 60 minutes
+#define SHORT_SLEEP 60   // 1 minutes
+#define TEMPERATURE_PACKS 12
+#define MEDIUM_SLEEP LONG_SLEEP / TEMPERATURE_PACKS  // 5 minutes
 #define SEND_TIMEOUT 245  // 245 millis seconds timeout
 #define ACK_TIMEOUT 5000
-#define INSPECTION_SIZE 8000
-#define NUMBER_OF_PARTS INSPECTION_SIZE / 40
+#define INSPECTION_SIZE 8200
+#define NUMBER_OF_PARTS (INSPECTION_SIZE / 40 ) // 205
 #define PACK_SIZE 40
 
 int16_t tempVibration[3][INSPECTION_SIZE];
@@ -49,6 +54,12 @@ struct __attribute__((packed)) SENSOR_DATA {
   float sample_rate;                // 4 bytes
   int16_t vibration[3][PACK_SIZE];  // 2 bytes * 3 * 40
 } tempSensor;
+
+typedef struct {
+  int count;
+} rtcStore;
+
+rtcStore rtcMem;
 
 uint8_t ack;
 unsigned long ack_time;
@@ -85,23 +96,31 @@ void OnDataRecv(uint8_t *mac, uint8_t *incomingData, uint8_t len) {
   }
 }
 
+ADC_MODE(ADC_VCC);
+
 void setup() {
   Serial.begin(115200);
+
+  Serial.println("Waking up...");
+  Serial.print("Reading ");
+
+  // rtcMem.count = -2;
+  // writeToRTCMemory();
+
+  readFromRTCMemory();
+  if (rtcMem.count > 50 || rtcMem.count < 0) {
+    rtcMem.count = 0;
+    Serial.print("Zerando Memória");
+    system_rtc_mem_write(RTCMEMORYSTART, &rtcMem, 4);
+    yield();
+  }
+
   pinMode(alimentacaoSensores, OUTPUT);
   digitalWrite(alimentacaoSensores, HIGH);
   delay(100);
   Serial.println("Start the DS18B20 sensor");
   // Start the DS18B20 sensor
   sensors.begin();
-  myIMU.settings.gyroEnabled = 0;  // Can be 0 or 1
-  myIMU.settings.accelEnabled = 1;
-  myIMU.settings.accelRange = 8;  // Max G force readable.  Can be: 2, 4, 8, 16
-  myIMU.settings.accelSampleRate = 6660;  // Hz.  Can be: 13, 26, 52, 104, 208,
-                                          // 416, 833, 1666, 3332, 6660, 13330
-  myIMU.settings.accelFifoEnabled =
-      0;  // Set to include accelerometer in the FIFO
-  myIMU.settings.tempEnabled = 0;
-  myIMU.settings.commMode = 1;
 
   WiFi.mode(WIFI_STA);  // Station mode for esp-now sensor node
   WiFi.disconnect();
@@ -128,110 +147,191 @@ void setup() {
 
   callbackCalled = false;
 
-  // verify connection
-  Serial.println("Testing device connections...");
-  Serial.println(myIMU.begin() == IMU_SUCCESS ? "LSM6DS3 connection successful"
-                                              : "LSM6DS3 connection failed");
-
   sensors.requestTemperatures();
   float temperatureC = sensors.getTempCByIndex(0);
   tempSensor.temp = temperatureC;
   Serial.print(temperatureC);
   Serial.println(" ºC");
   Serial.println("Coletando acelerômetro!");
-  unsigned long initTime = millis();
-  int samples = 0;
-  int16_t ax = 0, ay = 0, az = 0;
-  status_t readStatus = IMU_HW_ERROR;
-  uint8_t tempReadByte = 0;
 
-  // Coleta INSPECTION_SIZE amostras do acelerometro
-  while (samples < INSPECTION_SIZE) {
-    do {
-      readStatus =
-          myIMU.readRegister(&tempReadByte, LSM6DS3_ACC_GYRO_STATUS_REG);
-    } while (readStatus == IMU_SUCCESS &&
-             (tempReadByte & 0b00000001) == 0);  // wait for reading
+  if (rtcMem.count == 0) {
+    Serial.println("Temperatura e Vibração");
+    myIMU.settings.gyroEnabled = 0;  // Can be 0 or 1
+    myIMU.settings.accelEnabled = 1;
+    myIMU.settings.accelRange =
+        8;  // Max G force readable.  Can be: 2, 4, 8, 16
+    myIMU.settings.accelSampleRate =
+        6660;  // Hz.  Can be: 13, 26, 52, 104, 208,
+               // 416, 833, 1666, 3332, 6660, 13330
+    myIMU.settings.accelFifoEnabled =
+        0;  // Set to include accelerometer in the FIFO
+    myIMU.settings.tempEnabled = 0;
+    myIMU.settings.commMode = 1;
 
-    if (readStatus == IMU_SUCCESS) {
-      tempReadByte &= 0b00000001;
-      if (tempReadByte == 1) {
-        tempVibration[0][samples] = myIMU.readRawAccelX();
-        tempVibration[1][samples] = myIMU.readRawAccelX();
-        tempVibration[2][samples] = myIMU.readRawAccelX();
+    // verify connection
+    Serial.println("Testing device connections...");
+    Serial.println(myIMU.begin() == IMU_SUCCESS
+                       ? "LSM6DS3 connection successful"
+                       : "LSM6DS3 connection failed");
+    unsigned long initTime = millis();
+    int samples = 0;
+    int16_t ax = 0, ay = 0, az = 0;
+    status_t readStatus = IMU_HW_ERROR;
+    uint8_t tempReadByte = 0;
+
+    // Coleta INSPECTION_SIZE amostras do acelerometro
+    while (samples < INSPECTION_SIZE) {
+      do {
+        readStatus =
+            myIMU.readRegister(&tempReadByte, LSM6DS3_ACC_GYRO_STATUS_REG);
+      } while (readStatus == IMU_SUCCESS &&
+               (tempReadByte & 0b00000001) == 0);  // wait for reading
+
+      if (readStatus == IMU_SUCCESS) {
+        tempReadByte &= 0b00000001;
+        if (tempReadByte == 1) {
+          tempVibration[0][samples] = myIMU.readRawAccelX();
+          tempVibration[1][samples] = myIMU.readRawAccelX();
+          tempVibration[2][samples] = myIMU.readRawAccelX();
+        }
       }
+
+      samples++;
+      // Serial.println(samples);
     }
 
-    samples++;
-    // Serial.println(samples);
-  }
+    unsigned long finalTime = millis();
+    digitalWrite(alimentacaoSensores, LOW);
 
-  unsigned long finalTime = millis();
-  digitalWrite(alimentacaoSensores, LOW);
+    Serial.println(" Sample Rate!");
+    Serial.print((samples * 1000.0) / (finalTime - initTime));
+    Serial.println(" Hz");
+    Serial.println("Iniciando Envio");
 
-  Serial.println(" Sample Rate!");
-  Serial.print((samples * 1000.0) / (finalTime - initTime));
-  Serial.println(" Hz");
-  Serial.println("Iniciando Envio");
-
-  // send ack to start Package assembly
-  Serial.println("start Package assembly");
-  uint8_t CMD = 254;
-  esp_now_send(NULL, &CMD, 1);
-  while (!callbackCalled) {
-    delay(1);
-  }
-  callbackCalled = false;
-
-  Serial.println("Esperando ack");
-  ack_time = millis();
-  while (!acknowledged && ((millis() - ack_time) < ACK_TIMEOUT)) {
-    delay(1);
-  }
-  if (!acknowledged) {
-    Serial.println("Not Ack, indo mimir short");
-    gotoSleep(SHORT_SLEEP);
-  }
-
-  Serial.println("acked");
-
-  while (!endSession) {
-    if (packedSolicitation) {
-      packedSolicitation = false;
-      Serial.print("Solicitação de pacote ");
-      Serial.println(packageIdentifier);
-      tempSensor.identifier = packageIdentifier;
-      tempSensor.sample_rate = ((1000 * samples) / (finalTime - initTime));
-      uint16_t multiple = packageIdentifier * PACK_SIZE;
-      // Serial.print(multiple);
-      // Serial.println(" múltiplo!");
-      for (short int i = 0; i < PACK_SIZE; i++) {
-        tempSensor.vibration[0][i] = tempVibration[0][multiple + i];
-        tempSensor.vibration[1][i] = tempVibration[1][multiple + i];
-        tempSensor.vibration[2][i] = tempVibration[2][multiple + i];
-      }
-
-      uint8_t bs[sizeof(tempSensor)];
-      memcpy(bs, &tempSensor, sizeof(tempSensor));
-      Serial.print("Vou mandar: ");
-      Serial.println(tempSensor.identifier);
-      esp_now_send(NULL, bs,
-                   sizeof(tempSensor));  // NULL means send to all peers
-      // Waint until send is complete
-      while (!callbackCalled) {
-        delay(1);
-      }
-      callbackCalled = false;
+    // send ack to start Package assembly
+    Serial.println("start Package assembly");
+    uint8_t CMD = 254;
+    esp_now_send(NULL, &CMD, 1);
+    while (!callbackCalled) {
+      delay(1);
     }
-    delay(1);
-  }
+    callbackCalled = false;
 
-  Serial.println("Finalizado Envio");
+    Serial.println("Esperando ack");
+    ack_time = millis();
+    while (!acknowledged && ((millis() - ack_time) < ACK_TIMEOUT)) {
+      delay(1);
+    }
+    if (!acknowledged) {
+      Serial.println("Not Ack, indo mimir short");
+      gotoSleep(SHORT_SLEEP);
+    }
+
+    Serial.println("acked");
+
+    while (!endSession) {
+      if (packedSolicitation) {
+        packedSolicitation = false;
+        Serial.print("Solicitação de pacote ");
+        Serial.println(packageIdentifier);
+        tempSensor.identifier = packageIdentifier;
+        tempSensor.sample_rate = ((1000 * samples) / (finalTime - initTime));
+        uint16_t multiple = packageIdentifier * PACK_SIZE;
+        // Serial.print(multiple);
+        // Serial.println(" múltiplo!");
+        for (short int i = 0; i < PACK_SIZE; i++) {
+          tempSensor.vibration[0][i] = tempVibration[0][multiple + i];
+          tempSensor.vibration[1][i] = tempVibration[1][multiple + i];
+          tempSensor.vibration[2][i] = tempVibration[2][multiple + i];
+        }
+
+        uint8_t bs[sizeof(tempSensor)];
+        memcpy(bs, &tempSensor, sizeof(tempSensor));
+        Serial.print("Vou mandar: ");
+        Serial.println(tempSensor.identifier);
+        esp_now_send(NULL, bs,
+                     sizeof(tempSensor));  // NULL means send to all peers
+        // Waint until send is complete
+        while (!callbackCalled) {
+          delay(1);
+        }
+        callbackCalled = false;
+      }
+      delay(1);
+    }
+
+    Serial.println("Finalizado Envio");
+    Serial.print("Writing ");
+    writeToRTCMemory();
+
+  } else {
+    Serial.println("Só temperatura");
+    // send ack to start Package assembly
+    Serial.println("start Package assembly");
+    uint8_t CMD = 255;
+    esp_now_send(NULL, &CMD, 1);
+    while (!callbackCalled) {
+      delay(1);
+    }
+    callbackCalled = false;
+
+    Serial.println("Esperando ack");
+    ack_time = millis();
+    while (!acknowledged && ((millis() - ack_time) < ACK_TIMEOUT)) {
+      delay(1);
+    }
+    if (!acknowledged) {
+      Serial.println("Not Ack, indo mimir short");
+      gotoSleep(SHORT_SLEEP);
+    }
+
+    Serial.println("acked Só temperatura");
+    while (!endSession) {
+      if (packedSolicitation) {
+        packedSolicitation = false;
+        Serial.print("Solicitação de pacote ");
+        Serial.println(packageIdentifier);
+        tempSensor.identifier = 255;
+
+        if (packageIdentifier == 0) {
+          tempSensor.temp = temperatureC;
+          uint8_t bs[sizeof(tempSensor)];
+          memcpy(bs, &tempSensor, sizeof(tempSensor));
+          Serial.println("Enviando Temperatura");
+          esp_now_send(NULL, bs,
+                       sizeof(tempSensor));  // NULL means send to all peers
+          // Waint until send is complete
+          while (!callbackCalled) {
+            delay(1);
+          }
+          callbackCalled = false;
+        } else if (packageIdentifier == 1) {
+          tempSensor.temp = ESP.getVcc();
+          uint8_t bs[sizeof(tempSensor)];
+          memcpy(bs, &tempSensor, sizeof(tempSensor));
+          Serial.print("Enviando VCC: ");
+          Serial.println(tempSensor.temp);
+          esp_now_send(NULL, bs,
+                       sizeof(tempSensor));  // NULL means send to all peers
+          // Waint until send is complete
+          while (!callbackCalled) {
+            delay(1);
+          }
+          callbackCalled = false;
+        }
+      }
+      delay(1);
+    }
+
+    Serial.println("Finalizado Envio Só temperatura");
+    Serial.print("Writing ");
+    writeToRTCMemory();
+  }
 }
 
 void loop() {
   if (callbackCalled || (millis() > SEND_TIMEOUT)) {
-    gotoSleep(LONG_SLEEP);
+    gotoSleep(MEDIUM_SLEEP);
   }
 }
 
@@ -241,4 +341,26 @@ void gotoSleep(int sleepTime) {
   Serial.printf("Up for %i ms, going to sleep for %i secs...\n", millis(),
                 sleepSecs);
   ESP.deepSleep(sleepSecs * 1000000);
+}
+
+void readFromRTCMemory() {
+  system_rtc_mem_read(RTCMEMORYSTART, &rtcMem, sizeof(rtcMem));
+
+  Serial.print("count = ");
+  Serial.println(rtcMem.count);
+  yield();
+}
+
+void writeToRTCMemory() {
+  if (rtcMem.count <= TEMPERATURE_PACKS) {
+    rtcMem.count++;
+  } else {
+    rtcMem.count = 0;
+  }
+
+  system_rtc_mem_write(RTCMEMORYSTART, &rtcMem, 4);
+
+  Serial.print("count = ");
+  Serial.println(rtcMem.count);
+  yield();
 }
